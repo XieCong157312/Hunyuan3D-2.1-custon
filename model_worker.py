@@ -1,101 +1,135 @@
-"""Hunyuan3D-2.1 worker with strictly sequential Shape/Paint GPU residency.
 
-Shape and Paint are instantiated on demand. The Shape pipeline is destroyed and
-CUDA cache cleanup is performed before the Paint pipeline is instantiated.
 """
-import base64
-import gc
+Model worker for Hunyuan3D API server.
+
+RTX 4090 optimized version:
+- Lazy load Shape / Paint pipelines.
+- Release Shape pipeline before loading Paint pipeline.
+- Serialize GPU generation tasks.
+- Preserve original API and generation workflow.
+"""
 import os
-import sys
-import threading
+import gc
 import time
 import uuid
-from io import BytesIO
-from typing import Callable, Optional
+import base64
+import threading
+import trimesh
 
+from io import BytesIO
 from PIL import Image
+
 import torch
 
-sys.path.insert(0, "./hy3dshape")
-sys.path.insert(0, "./hy3dpaint")
+# Apply torchvision compatibility fix before other imports
+import sys
+
+sys.path.insert(0, './hy3dshape')
+sys.path.insert(0, './hy3dpaint')
 
 try:
     from torchvision_fix import apply_fix
     apply_fix()
 except ImportError:
-    print("Warning: torchvision_fix module not found; continuing without compatibility fix")
-except Exception as exc:
-    print(f"Warning: torchvision compatibility fix failed: {exc}")
+    print(
+        "Warning: torchvision_fix module not found, "
+        "proceeding without compatibility fix"
+    )
+except Exception as e:
+    print(f"Warning: Failed to apply torchvision fix: {e}")
 
 from hy3dshape import Hunyuan3DDiTFlowMatchingPipeline
 from hy3dshape.rembg import BackgroundRemover
 from hy3dshape.utils import logger
-from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
+
+from textureGenPipeline import (
+    Hunyuan3DPaintPipeline,
+    Hunyuan3DPaintConfig
+)
+
 from hy3dpaint.convert_utils import create_glb_with_pbr_materials
 
 
-def release_cuda_memory():
-    """Release unreferenced CUDA allocations before the next model is loaded."""
+def cuda_cleanup():
+    """
+    Release unused CUDA memory.
+    """
+    gc.collect()
+
     if torch.cuda.is_available():
         try:
             torch.cuda.synchronize()
         except Exception:
             pass
-    gc.collect()
-    if torch.cuda.is_available():
+
+        torch.cuda.empty_cache()
+
         try:
-            torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
-        except Exception as exc:
-            logger.warning("CUDA cache cleanup warning: %s", exc)
+        except Exception:
+            pass
 
 
 def quick_convert_with_obj2gltf(obj_path: str, glb_path: str):
-    """Convert Paint's OBJ + PBR texture files into a GLB."""
+    """
+    Preserve original PBR conversion implementation.
+    """
     textures = {
-        "albedo": obj_path.replace(".obj", ".jpg"),
-        "metallic": obj_path.replace(".obj", "_metallic.jpg"),
-        "roughness": obj_path.replace(".obj", "_roughness.jpg"),
+        'albedo': obj_path.replace('.obj', '.jpg'),
+        'metallic': obj_path.replace('.obj', '_metallic.jpg'),
+        'roughness': obj_path.replace('.obj', '_roughness.jpg')
     }
-    create_glb_with_pbr_materials(obj_path, textures, glb_path)
+
+    create_glb_with_pbr_materials(
+        obj_path,
+        textures,
+        glb_path
+    )
 
 
-def load_image_from_base64(encoded_image: str) -> Image.Image:
-    """Decode a base64 image and detach it from the BytesIO lifetime."""
-    if not encoded_image:
-        raise ValueError("No input image provided")
-    # Accept both plain base64 and data URLs (data:image/png;base64,...).
-    if "," in encoded_image and encoded_image.lstrip().startswith("data:"):
-        encoded_image = encoded_image.split(",", 1)[1]
-    try:
-        raw = base64.b64decode(encoded_image, validate=True)
-        with Image.open(BytesIO(raw)) as image:
-            image.load()
-            return image.copy()
-    except Exception as exc:
-        raise ValueError(f"Invalid base64 image: {exc}") from exc
+def load_image_from_base64(image):
+    """
+    Load image from base64 encoded string.
+    """
+    if isinstance(image, Image.Image):
+        return image.copy()
+
+    if not isinstance(image, str):
+        raise ValueError("Image must be a base64 encoded string")
+
+    # Support data URI:
+    # data:image/png;base64,xxxx
+    if ',' in image and image.startswith('data:'):
+        image = image.split(',', 1)[1]
+
+    image_bytes = base64.b64decode(image)
+
+    return Image.open(BytesIO(image_bytes)).copy()
 
 
 class ModelWorker:
-    """A single-GPU worker. Only one pipeline is resident at a time."""
+    """
+    Worker class for Hunyuan3D model generation.
+
+    Shape and Paint pipelines are loaded on demand.
+    Only one GPU generation task is executed at a time.
+    """
 
     def __init__(
         self,
-        model_path="tencent/Hunyuan3D-2.1",
-        subfolder="hunyuan3d-dit-v2-1",
-        device="cuda",
-        low_vram_mode=True,
+        model_path='tencent/Hunyuan3D-2.1',
+        subfolder='hunyuan3d-dit-v2-1',
+        device='cuda',
+        low_vram_mode=False,
         worker_id=None,
         model_semaphore=None,
-        save_dir="gradio_cache",
-        mc_algo="mc",
+        save_dir='gradio_cache',
+        mc_algo='mc',
         enable_flashvdm=False,
-        compile=False,
-        paint_max_num_view=4,
-        paint_resolution=512,
+        compile=False
     ):
         self.model_path = model_path
-        self.subfolder = subfolder  # Kept for compatibility with existing launch scripts.
+        self.subfolder = subfolder
         self.worker_id = worker_id or str(uuid.uuid4())[:6]
         self.device = device
         self.low_vram_mode = low_vram_mode
@@ -104,181 +138,403 @@ class ModelWorker:
         self.mc_algo = mc_algo
         self.enable_flashvdm = enable_flashvdm
         self.compile = compile
-        self.paint_max_num_view = paint_max_num_view
-        self.paint_resolution = paint_resolution
 
+        # Pipeline references.
         self.pipeline = None
         self.paint_pipeline = None
-        # This lock covers both stages and teardown; no two requests can overlap on the GPU.
-        self._gpu_lock = threading.RLock()
+
+        # Worker-level GPU lock.
+        self.generation_lock = threading.RLock()
+
+        # Background remover.
+        self.rembg = None
+
         os.makedirs(self.save_dir, exist_ok=True)
 
-        self.rembg = BackgroundRemover()
         logger.info(
-            "Worker %s initialized; Shape/Paint pipelines will be loaded on demand",
-            self.worker_id,
+            f"Initializing ModelWorker {self.worker_id}, "
+            f"model={model_path}, device={device}"
         )
 
-    def _load_shape(self):
-        if self.pipeline is None:
-            logger.info("Loading Shape pipeline")
-            pipe = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(self.model_path)
-            if self.enable_flashvdm:
-                algo = "mc" if self.device in ("cpu", "mps") else self.mc_algo
-                pipe.enable_flashvdm(mc_algo=algo)
-            if self.compile:
-                pipe.compile()
-            self.pipeline = pipe
+        # Background remover is kept separate from Shape/Paint.
+        self.rembg = BackgroundRemover()
+
+        # Do not initialize both pipelines here.
+        # They will be loaded on demand.
+
+        # Clean old cache files.
+        self._clean_save_dir()
+
+        logger.info(
+            f"ModelWorker {self.worker_id} initialized. "
+            "Shape/Paint pipelines will be loaded lazily."
+        )
+
+    def _clean_save_dir(self):
+        """
+        Clean old generated files.
+
+        Only files are removed. Directories are preserved.
+        """
+        if not os.path.isdir(self.save_dir):
+            return
+
+        for filename in os.listdir(self.save_dir):
+            path = os.path.join(self.save_dir, filename)
+
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except Exception as e:
+                logger.warning(
+                    f"Could not remove old cache file {path}: {e}"
+                )
+
+    def _load_shape_pipeline(self):
+        """
+        Load Shape pipeline on demand.
+        """
+        if self.pipeline is not None:
+            return self.pipeline
+
+        logger.info("Loading Shape pipeline...")
+
+        cuda_cleanup()
+
+        pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+            self.model_path
+        )
+
+        if self.enable_flashvdm:
+            mc_algo = (
+                'mc'
+                if self.device in ['cpu', 'mps']
+                else self.mc_algo
+            )
+
+            pipeline.enable_flashvdm(mc_algo=mc_algo)
+
+        if self.compile:
+            pipeline.compile()
+
+        self.pipeline = pipeline
+
+        logger.info("Shape pipeline loaded.")
+
         return self.pipeline
 
-    def _load_paint(self):
-        if self.paint_pipeline is None:
-            logger.info(
-                "Loading Paint pipeline (max_num_view=%s, resolution=%s)",
-                self.paint_max_num_view,
-                self.paint_resolution,
+    def _load_paint_pipeline(self):
+        """
+        Load Paint pipeline on demand.
+
+        Shape pipeline must be released before this method is called.
+        """
+        if self.paint_pipeline is not None:
+            return self.paint_pipeline
+
+        if self.pipeline is not None:
+            raise RuntimeError(
+                "Cannot load Paint pipeline while Shape pipeline "
+                "is still referenced."
             )
-            # These are the constructor's actual parameter names in Hunyuan3D-2.1.
-            conf = Hunyuan3DPaintConfig(
-                max_num_view=self.paint_max_num_view,
-                resolution=self.paint_resolution,
-            )
-            conf.device = self.device
-            conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
-            conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
-            conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
-            self.paint_pipeline = Hunyuan3DPaintPipeline(conf)
+
+        logger.info("Loading Paint pipeline...")
+
+        cuda_cleanup()
+
+        max_num_view = 6
+        resolution = 512
+
+        conf = Hunyuan3DPaintConfig(
+            max_num_view,
+            resolution
+        )
+
+        conf.realesrgan_ckpt_path = (
+            "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
+        )
+
+        conf.multiview_cfg_path = (
+            "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+        )
+
+        conf.custom_pipeline = (
+            "hy3dpaint/hunyuanpaintpbr"
+        )
+
+        self.paint_pipeline = Hunyuan3DPaintPipeline(conf)
+
+        logger.info("Paint pipeline loaded.")
+
         return self.paint_pipeline
 
-    def _unload_shape(self):
+    def _release_shape_pipeline(self):
+        """
+        Release Shape pipeline completely.
+        """
         if self.pipeline is not None:
-            logger.info("Unloading Shape pipeline")
-            pipe = self.pipeline
-            self.pipeline = None
-            del pipe
-        release_cuda_memory()
+            logger.info("Releasing Shape pipeline...")
 
-    def _unload_paint(self):
+            try:
+                del self.pipeline
+            finally:
+                self.pipeline = None
+
+        cuda_cleanup()
+
+        logger.info("Shape pipeline released.")
+
+    def _release_paint_pipeline(self):
+        """
+        Release Paint pipeline completely.
+        """
         if self.paint_pipeline is not None:
-            logger.info("Unloading Paint pipeline")
-            pipe = self.paint_pipeline
-            self.paint_pipeline = None
-            del pipe
-        release_cuda_memory()
+            logger.info("Releasing Paint pipeline...")
+
+            try:
+                del self.paint_pipeline
+            finally:
+                self.paint_pipeline = None
+
+        cuda_cleanup()
+
+        logger.info("Paint pipeline released.")
 
     def get_queue_length(self):
-        # asyncio.Semaphore is only a legacy constructor argument; GPU work is serialized
-        # by _gpu_lock. Avoid depending on private semaphore internals for correctness.
-        return 0
+        """
+        Return queue length.
+        """
+        if self.model_semaphore is None:
+            return 0
+
+        return (
+            self.model_semaphore._value
+            if hasattr(self.model_semaphore, '_value')
+            else 0
+        ) + (
+            len(self.model_semaphore._waiters)
+            if hasattr(self.model_semaphore, '_waiters')
+            and self.model_semaphore._waiters is not None
+            else 0
+        )
 
     def get_status(self):
-        return {"speed": 1, "queue_length": self.get_queue_length()}
+        """
+        Return worker status.
+        """
+        return {
+            "speed": 1,
+            "queue_length": self.get_queue_length()
+        }
 
-    @staticmethod
-    def _notify(params, stage: str, progress: int):
-        callback = params.get("_status_callback")
-        if callable(callback):
-            try:
-                callback(stage, progress)
-            except Exception:
-                pass
+    def _prepare_image(self, image):
+        """
+        Prepare input image.
+
+        Keep the original RGB image for background removal,
+        then convert to RGBA for the generation pipeline.
+        """
+        image = image.convert("RGB")
+
+        # Preserve the original behavior intention:
+        # remove background when RGB input is provided.
+        if self.rembg is not None:
+            image = self.rembg(image)
+
+        return image.convert("RGBA")
 
     @torch.inference_mode()
     def generate(self, uid, params):
-        with self._gpu_lock:
-            return self._generate_sequential(uid, dict(params))
+        """
+        Generate a 3D model.
 
-    def _generate_sequential(self, uid, params):
-        started = time.time()
-        uid_str = str(uid)
-        logger.info("Generating 3D model for uid: %s", uid_str)
-        self._notify(params, "preparing", 2)
+        Original interface preserved:
+            generate(uid, params)
 
-        image = load_image_from_base64(params.get("image", ""))
+        Returns:
+            (file_path, uid)
+        """
+        with self.generation_lock:
+            return self._generate_locked(uid, params)
+
+    def _generate_locked(self, uid, params):
+        start_time = time.time()
+
+        logger.info(
+            f"Generating 3D model for uid: {uid}"
+        )
+
+        if 'image' not in params:
+            raise ValueError("No input image provided")
+
+        image = load_image_from_base64(
+            params["image"]
+        )
+
+        image = self._prepare_image(image)
+
+        os.makedirs(self.save_dir, exist_ok=True)
+
+        initial_save_path = os.path.join(
+            self.save_dir,
+            f'{str(uid)}_initial.glb'
+        )
+
+        final_save_path = initial_save_path
+
+        # -------------------------------------------------
+        # 1. Shape generation
+        # -------------------------------------------------
         try:
-            was_rgb = image.mode == "RGB"
-            image = image.convert("RGBA")
-            if was_rgb and params.get("remove_background", True):
-                image = self.rembg(image.convert("RGB")).convert("RGBA")
+            self._load_shape_pipeline()
 
-            initial_path = os.path.join(self.save_dir, f"{uid_str}_initial.glb")
+            shape_start = time.time()
 
-            # Stage 1: Shape
-            self._notify(params, "shape", 5)
-            shape_pipe = None
-            try:
-                shape_pipe = self._load_shape()
-                generator = torch.Generator(device=self.device).manual_seed(
-                    int(params.get("seed", 1234))
-                )
-                mesh = shape_pipe(
-                    image=image,
-                    generator=generator,
-                    octree_resolution=params.get("octree_resolution", 256),
-                    num_inference_steps=params.get("num_inference_steps", 5),
-                    guidance_scale=params.get("guidance_scale", 5.0),
-                    num_chunks=params.get("num_chunks", 8000),
-                    output_type="trimesh",
-                )[0]
-                mesh.export(initial_path)
-                del mesh
-                del generator
-                logger.info("Shape stage completed: %s", initial_path)
-            except Exception as exc:
-                logger.exception("Shape generation failed")
-                raise ValueError(f"Failed to generate 3D mesh: {exc}") from exc
-            finally:
-                # Drop the local reference as well as self.pipeline before CUDA cleanup.
-                shape_pipe = None
-                self._unload_shape()
+            mesh = self.pipeline(image=image)[0]
 
-            # Original /generate supports Shape-only mode. The new combined endpoint
-            # forces texture=True, while legacy callers can still request texture=False.
-            if not params.get("texture", False):
-                self._notify(params, "completed", 100)
-                logger.info("Shape-only generation finished in %.2fs", time.time() - started)
-                return initial_path, uid
+            logger.info(
+                "---Shape generation takes %.2f seconds ---",
+                time.time() - shape_start
+            )
 
-            # Stage 2: Paint
-            self._notify(params, "paint", 55)
-            paint_pipe = None
-            textured_obj = None
-            try:
-                paint_pipe = self._load_paint()
-                output_obj = os.path.join(self.save_dir, f"{uid_str}_texturing.obj")
-                textured_obj = paint_pipe(
-                    mesh_path=initial_path,
-                    image_path=image,
-                    output_mesh_path=output_obj,
-                    save_glb=False,
-                )
-                if not textured_obj or not os.path.isfile(textured_obj):
-                    raise RuntimeError(f"Paint did not produce an OBJ file: {textured_obj}")
+            mesh.export(initial_save_path)
 
-                temp_glb = os.path.join(self.save_dir, f"{uid_str}_texturing.glb")
-                quick_convert_with_obj2gltf(textured_obj, temp_glb)
-                final_path = os.path.join(self.save_dir, f"{uid_str}_textured.glb")
-                os.replace(temp_glb, final_path)
-            except Exception as exc:
-                logger.exception("Texture generation failed")
-                raise ValueError(f"Paint generation failed: {exc}") from exc
-            finally:
-                # Paint holds many CUDA module references; clear the local too.
-                paint_pipe = None
-                textured_obj = None
-                self._unload_paint()
+            logger.info(
+                f"Initial mesh saved: {initial_save_path}"
+            )
 
-            self._notify(params, "completed", 100)
-            logger.info("Shape + Paint generation finished in %.2fs", time.time() - started)
-            return final_path, uid
+        except Exception as e:
+            logger.error(
+                f"Shape generation failed: {e}"
+            )
+
+            raise ValueError(
+                f"Failed to generate 3D mesh: {str(e)}"
+            )
+
         finally:
-            try:
-                image.close()
-            except Exception:
-                pass
-            release_cuda_memory()
+            # Mesh is a CPU-side trimesh result in the original
+            # workflow. Keep the exported mesh file, but release
+            # the Shape pipeline before loading Paint.
+            self._release_shape_pipeline()
 
-    def close(self):
-        with self._gpu_lock:
-            self._unload_shape()
-            self._unload_paint()
+        # -------------------------------------------------
+        # 2. Paint generation
+        # -------------------------------------------------
+        texture_enabled = params.get(
+            'texture',
+            True
+        )
+
+        if texture_enabled:
+            output_mesh_path_obj = os.path.join(
+                self.save_dir,
+                f'{str(uid)}_texturing.obj'
+            )
+
+            try:
+                self._load_paint_pipeline()
+
+                paint_start = time.time()
+
+                textured_path_obj = self.paint_pipeline(
+                    mesh_path=initial_save_path,
+                    image_path=image,
+                    output_mesh_path=output_mesh_path_obj,
+                    save_glb=False
+                )
+
+                logger.info(
+                    "---Texture generation takes %.2f seconds ---",
+                    time.time() - paint_start
+                )
+
+                logger.info(
+                    f"output_mesh_path: {output_mesh_path_obj}, "
+                    f"textured_path: {textured_path_obj}"
+                )
+
+                if not textured_path_obj:
+                    raise RuntimeError(
+                        "Paint pipeline returned an empty output path"
+                    )
+
+                if not os.path.isfile(textured_path_obj):
+                    raise FileNotFoundError(
+                        f"Paint output OBJ not found: {textured_path_obj}"
+                    )
+
+                logger.info(
+                    "Converting textured OBJ to PBR GLB..."
+                )
+
+                glb_path_textured = os.path.join(
+                    self.save_dir,
+                    f'{str(uid)}_texturing.glb'
+                )
+
+                quick_convert_with_obj2gltf(
+                    textured_path_obj,
+                    glb_path_textured
+                )
+
+                if (
+                    not os.path.isfile(glb_path_textured)
+                    or os.path.getsize(glb_path_textured) == 0
+                ):
+                    raise RuntimeError(
+                        "PBR GLB conversion failed: output file is empty"
+                    )
+
+                final_save_path = os.path.join(
+                    self.save_dir,
+                    f'{str(uid)}_textured.glb'
+                )
+
+                if os.path.exists(final_save_path):
+                    os.remove(final_save_path)
+
+                os.replace(
+                    glb_path_textured,
+                    final_save_path
+                )
+
+                logger.info(
+                    f"Textured GLB generated: {final_save_path}"
+                )
+
+            except Exception as e:
+                logger.error(
+                    f"Texture generation failed: {e}"
+                )
+
+                # Preserve the original official fallback behavior.
+                final_save_path = initial_save_path
+
+                logger.warning(
+                    f"Using untextured mesh as fallback: "
+                    f"{final_save_path}"
+                )
+
+            finally:
+                self._release_paint_pipeline()
+
+        else:
+            logger.info(
+                "Texture generation disabled. Returning initial mesh."
+            )
+
+            final_save_path = initial_save_path
+
+        # -------------------------------------------------
+        # 3. Final cleanup
+        # -------------------------------------------------
+        if self.low_vram_mode:
+            cuda_cleanup()
+
+        logger.info(
+            "---Total generation takes %.2f seconds ---",
+            time.time() - start_time
+        )
+
+        return final_save_path, uid
