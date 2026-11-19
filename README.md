@@ -3,6 +3,9 @@
   <img src="assets/images/teaser.jpg">
 </p>
 
+### 增项
+  在原项目基础上，完善了对于在单卡4090上同时shape and paint的支持
+ 
 
 <div align="center">
   <a href=https://3d.hunyuan.tencent.com target="_blank"><img src=https://img.shields.io/badge/Official%20Site-333399.svg?logo=homepage height=22px></a>
